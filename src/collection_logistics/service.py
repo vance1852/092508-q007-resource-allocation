@@ -10,8 +10,8 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .errors import Conflict, Forbidden, InvalidState, NotFound, ResourceConstraint, ValidationFailed
+from .models import GRADE_ORDER, DeploymentCommand, RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -23,6 +23,7 @@ from .planning import (
     effective_capacity,
     latest_streak,
     moving_average,
+    pick_lots_fefo,
     quantize_volume,
     scenario_projection,
     weighted_inventory_cost,
@@ -265,7 +266,7 @@ class CollectionLogisticsService:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
                     "INSERT INTO preservation_resource_lots(preservation_resource_lot_id,center_id,preservation_resource_kind,grade,quantity_units,available_units,"
-                    "unit_cost_cny,received_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "unit_cost_cny,received_at,expires_at,state,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         lot.preservation_resource_lot_id,
                         lot.center_id,
@@ -275,6 +276,8 @@ class CollectionLogisticsService:
                         decimal_text(lot.quantity_units),
                         decimal_text(lot.unit_cost_cny),
                         lot.received_at,
+                        lot.expires_at,
+                        lot.state,
                         actor_id,
                         self._now(),
                     ),
@@ -322,7 +325,7 @@ class CollectionLogisticsService:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
                     "INSERT INTO dispatch_requests(dispatch_id,corridor_id,specimen_event_id,duty_date,requested_units,"
-                    "priority,idempotency_key,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "priority,required_grade,idempotency_key,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (
                         dispatch_request.dispatch_id,
                         dispatch_request.corridor_id,
@@ -330,6 +333,7 @@ class CollectionLogisticsService:
                         dispatch_request.duty_date,
                         decimal_text(dispatch_request.requested_units),
                         dispatch_request.priority,
+                        dispatch_request.required_grade,
                         dispatch_request.idempotency_key,
                         actor_id,
                         self._now(),
@@ -404,66 +408,279 @@ class CollectionLogisticsService:
             self._audit("route", corridor_id, "allocation.completed", actor_id, {"plan_id": plan_id})
         return {"plan_id": plan_id, **result}
 
-    def dispatch_deployment(
+    def _lot_violations(
         self,
-        actor_id: str,
-        deployment_id: str,
-        dispatch_id: str,
-        preservation_resource_lot_id: str,
-        expected_revision: int,
-    ) -> dict[str, Any]:
+        lot: sqlite3.Row,
+        *,
+        origin_center_id: str,
+        required_grade: str,
+        duty_date: str,
+    ) -> list[dict[str, str]]:
+        """返回批次相对任务约束的全部不满足项；空列表表示批次兼容。"""
+        violations: list[dict[str, str]] = []
+        if lot["center_id"] != origin_center_id:
+            violations.append({
+                "constraint": "origin_center",
+                "expected": origin_center_id,
+                "actual": lot["center_id"],
+                "message": f"批次 {lot['preservation_resource_lot_id']} 位于库房 {lot['center_id']}，不在起运库房 {origin_center_id}",
+            })
+        if lot["state"] != "available":
+            violations.append({
+                "constraint": "lot_state",
+                "expected": "available",
+                "actual": lot["state"],
+                "message": f"批次 {lot['preservation_resource_lot_id']} 状态为 {lot['state']}，不可分配",
+            })
+        if GRADE_ORDER[lot["grade"]] < GRADE_ORDER[required_grade]:
+            violations.append({
+                "constraint": "preservation_grade",
+                "expected": required_grade,
+                "actual": lot["grade"],
+                "message": f"批次 {lot['preservation_resource_lot_id']} 保藏等级 {lot['grade']} 低于任务要求 {required_grade}",
+            })
+        if lot["expires_at"] is not None and lot["expires_at"] < duty_date:
+            violations.append({
+                "constraint": "expiry",
+                "expected": f"expires_at >= {duty_date}",
+                "actual": lot["expires_at"],
+                "message": f"批次 {lot['preservation_resource_lot_id']} 已于 {lot['expires_at']} 到期，任务日期为 {duty_date}",
+            })
+        return violations
+
+    def dispatch_deployment(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            return self._dispatch_deployment_locked(actor_id, raw)
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("发运指令编号或幂等键冲突") from exc
+
+    def _dispatch_deployment_locked(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "deployment.write")
-        dispatch_request = self.connection.execute(
-            "SELECT n.*,r.delay_basis_points,r.response_minutes,r.origin_center_id FROM dispatch_requests n "
-            "JOIN road_corridors r ON r.corridor_id=n.corridor_id WHERE n.dispatch_id=?",
-            (dispatch_id,),
-        ).fetchone()
-        if dispatch_request is None:
-            raise NotFound("调度申请不存在")
-        if dispatch_request["state"] != "allocated" or dispatch_request["revision"] != expected_revision:
-            raise InvalidState("调度申请不是当前可资源到场版本")
-        lot = self.connection.execute("SELECT * FROM preservation_resource_lots WHERE preservation_resource_lot_id=?", (preservation_resource_lot_id,)).fetchone()
-        if lot is None:
-            raise NotFound("应急资源批次不存在")
-        allocated = Decimal(dispatch_request["allocated_units"])
-        available = Decimal(lot["available_units"])
-        if lot["center_id"] != dispatch_request["origin_center_id"] or lot["preservation_resource_kind"] != self.route(dispatch_request["corridor_id"])["preservation_resource_kind"]:
-            raise Conflict("应急资源批次与转运路线起点或电源类型不匹配")
-        if available < allocated:
-            raise Conflict("应急资源库存不足以完成分配")
-        expected_delivery = delivered_after_loss(allocated, int(dispatch_request["delay_basis_points"]))
-        departed_at = self._now()
+        command = DeploymentCommand.from_dict(raw)
+        request_digest = digest(raw)
         with transaction(self.connection, immediate=True):
-            self.connection.execute(
-                "UPDATE preservation_resource_lots SET available_units=?,revision=revision+1 WHERE preservation_resource_lot_id=? AND revision=?",
-                (decimal_text(quantize_volume(available - allocated)), preservation_resource_lot_id, lot["revision"]),
+            stored = self.connection.execute(
+                "SELECT request_sha256,response_json FROM traffic_idempotency "
+                "WHERE scope='deployment' AND idempotency_key=?",
+                (command.idempotency_key,),
+            ).fetchone()
+            if stored is not None:
+                if stored["request_sha256"] != request_digest:
+                    raise Conflict("幂等键对应不同资源到场指令内容")
+                return json.loads(stored["response_json"])
+
+            dispatch_request = self.connection.execute(
+                "SELECT n.*,r.preservation_resource_kind,r.delay_basis_points,r.response_minutes,"
+                "r.origin_center_id,r.destination_center_id,r.state AS route_state "
+                "FROM dispatch_requests n JOIN road_corridors r ON r.corridor_id=n.corridor_id "
+                "WHERE n.dispatch_id=?",
+                (command.dispatch_id,),
+            ).fetchone()
+            if dispatch_request is None:
+                raise NotFound("调度申请不存在")
+            if dispatch_request["state"] != "allocated":
+                raise InvalidState(
+                    "调度申请不是已分配可到场状态",
+                    {"dispatch_id": command.dispatch_id, "actual_state": dispatch_request["state"], "expected_state": "allocated"},
+                )
+            if dispatch_request["revision"] != command.expected_revision:
+                raise InvalidState(
+                    "调度申请版本已变化，请基于最新版本重新发起",
+                    {"dispatch_id": command.dispatch_id, "expected_revision": command.expected_revision,
+                     "actual_revision": dispatch_request["revision"]},
+                )
+            if dispatch_request["route_state"] != "active":
+                raise InvalidState(
+                    "转运路线当前不可发运",
+                    {"corridor_id": dispatch_request["corridor_id"], "actual_state": dispatch_request["route_state"]},
+                )
+
+            required_units = Decimal(dispatch_request["allocated_units"])
+            required_grade = dispatch_request["required_grade"]
+            origin_center_id = dispatch_request["origin_center_id"]
+            required_kind = dispatch_request["preservation_resource_kind"]
+            duty_date = dispatch_request["duty_date"]
+
+            # 同材料类别的全部批次都纳入核对，便于逐一指出库房、状态、等级、效期约束冲突。
+            lots = self.connection.execute(
+                "SELECT * FROM preservation_resource_lots WHERE preservation_resource_kind=? ORDER BY preservation_resource_lot_id",
+                (required_kind,),
+            ).fetchall()
+            rejected: list[dict[str, Any]] = []
+            compatible: list[sqlite3.Row] = []
+            for lot in lots:
+                violations = self._lot_violations(
+                    lot,
+                    origin_center_id=origin_center_id,
+                    required_grade=required_grade,
+                    duty_date=duty_date,
+                )
+                if violations:
+                    rejected.append({
+                        "preservation_resource_lot_id": lot["preservation_resource_lot_id"],
+                        "center_id": lot["center_id"],
+                        "grade": lot["grade"],
+                        "state": lot["state"],
+                        "expires_at": lot["expires_at"],
+                        "available_units": lot["available_units"],
+                        "violations": violations,
+                    })
+                elif Decimal(lot["available_units"]) > 0:
+                    compatible.append(lot)
+
+            # 近效期优先（FEFO）：有有效期的早到期先用，无有效期的垫底；同效期按入库时间、批次号。
+            compatible.sort(key=lambda lot: (
+                1 if lot["expires_at"] is None else 0,
+                lot["expires_at"] or "",
+                lot["received_at"],
+                lot["preservation_resource_lot_id"],
+            ))
+            candidates = [(lot["preservation_resource_lot_id"], Decimal(lot["available_units"])) for lot in compatible]
+            picks, shortfall = pick_lots_fefo(required_units, candidates)
+            compatible_total = quantize_volume(sum((Decimal(lot["available_units"]) for lot in compatible), Decimal(0)))
+            if not picks or shortfall > 0:
+                raise ResourceConstraint(
+                    "起运库房满足材料类别、保藏等级、状态和有效期全部约束的批次库存不足",
+                    {
+                        "dispatch_id": command.dispatch_id,
+                        "origin_center_id": origin_center_id,
+                        "required_preservation_resource_kind": required_kind,
+                        "required_grade": required_grade,
+                        "duty_date": duty_date,
+                        "required_units": decimal_text(required_units),
+                        "compatible_available_units": decimal_text(compatible_total),
+                        "shortage_units": decimal_text(shortfall),
+                        "rejected_lots": rejected,
+                    },
+                )
+
+            lot_by_id = {lot["preservation_resource_lot_id"]: lot for lot in compatible}
+            lot_changes: list[dict[str, Any]] = []
+            for rank, (lot_id, take) in enumerate(picks, start=1):
+                lot = lot_by_id[lot_id]
+                before = quantize_volume(Decimal(lot["available_units"]))
+                after = quantize_volume(before - take)
+                cursor = self.connection.execute(
+                    "UPDATE preservation_resource_lots SET available_units=?,revision=revision+1,"
+                    "state=CASE WHEN CAST(? AS REAL)=0 THEN 'depleted' ELSE state END "
+                    "WHERE preservation_resource_lot_id=? AND revision=? "
+                    "AND CAST(available_units AS REAL)=CAST(? AS REAL) AND state='available'",
+                    (decimal_text(after), decimal_text(after), lot_id, lot["revision"], decimal_text(before)),
+                )
+                if cursor.rowcount != 1:
+                    raise Conflict(
+                        "批次在分配期间被其他事务改动，请重试",
+                        {"preservation_resource_lot_id": lot_id, "expected_revision": lot["revision"]},
+                    )
+                lot_changes.append({
+                    "preservation_resource_lot_id": lot_id,
+                    "grade": lot["grade"],
+                    "expires_at": lot["expires_at"],
+                    "selection_rank": rank,
+                    "selection_basis": "fefo_nearest_expiry",
+                    "allocated_units": decimal_text(take),
+                    "available_before_units": decimal_text(before),
+                    "available_after_units": decimal_text(after),
+                    "revision_before": lot["revision"],
+                    "revision_after": lot["revision"] + 1,
+                })
+
+            allocated_total = quantize_volume(sum((take for _, take in picks), Decimal(0)))
+            expected_delivery = delivered_after_loss(allocated_total, int(dispatch_request["delay_basis_points"]))
+            departed_at = self._now()
+            expected_arrival = utc_text(
+                parse_utc(departed_at) + timedelta(hours=int(dispatch_request["response_minutes"]))
             )
-            self.connection.execute(
-                "UPDATE dispatch_requests SET state='in_transit',revision=revision+1 WHERE dispatch_id=? AND revision=?",
-                (dispatch_id, expected_revision),
+
+            update_cursor = self.connection.execute(
+                "UPDATE dispatch_requests SET state='in_transit',revision=revision+1 "
+                "WHERE dispatch_id=? AND revision=? AND state='allocated'",
+                (command.dispatch_id, command.expected_revision),
             )
+            if update_cursor.rowcount != 1:
+                raise Conflict("调度申请在分配期间被其他事务改动，请重试")
+
             self.connection.execute(
                 "INSERT INTO deployments(deployment_id,dispatch_id,inventory_preservation_resource_lot_id,deployed_units,"
-                "expected_arrived_units,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "expected_arrived_units,departed_at,idempotency_key,request_sha256,created_by,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    deployment_id,
-                    dispatch_id,
-                    preservation_resource_lot_id,
-                    decimal_text(allocated),
+                    command.deployment_id,
+                    command.dispatch_id,
+                    picks[0][0],
+                    decimal_text(allocated_total),
                     decimal_text(expected_delivery),
                     departed_at,
+                    command.idempotency_key,
+                    request_digest,
                     actor_id,
                     departed_at,
                 ),
             )
-            self._audit("deployment", deployment_id, "deployment.dispatched", actor_id, {"dispatch_id": dispatch_id})
-        return {
-            "deployment_id": deployment_id,
-            "state": "in_transit",
-            "deployed_units": decimal_text(allocated),
-            "expected_arrived_units": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(dispatch_request["response_minutes"]))),
-        }
+            for change in lot_changes:
+                self.connection.execute(
+                    "INSERT INTO deployment_lot_allocations(deployment_id,preservation_resource_lot_id,lot_grade,lot_expires_at,"
+                    "lot_revision_before,available_before_units,allocated_units,available_after_units,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        command.deployment_id,
+                        change["preservation_resource_lot_id"],
+                        change["grade"],
+                        change["expires_at"],
+                        change["revision_before"],
+                        change["available_before_units"],
+                        change["allocated_units"],
+                        change["available_after_units"],
+                        departed_at,
+                    ),
+                )
+
+            selection_payload = {
+                "policy": "FEFO_NEAREST_EXPIRY",
+                "requirements": {
+                    "corridor_id": dispatch_request["corridor_id"],
+                    "origin_center_id": origin_center_id,
+                    "destination_center_id": dispatch_request["destination_center_id"],
+                    "preservation_resource_kind": required_kind,
+                    "required_grade": required_grade,
+                    "duty_date": duty_date,
+                    "required_units": decimal_text(required_units),
+                },
+                "compatible_available_units": decimal_text(compatible_total),
+                "deployed_units": decimal_text(allocated_total),
+                "lot_changes": lot_changes,
+                "rejected_lots": rejected,
+                "actor_id": actor_id,
+            }
+            self._audit(
+                "deployment",
+                command.deployment_id,
+                "deployment.dispatched",
+                actor_id,
+                selection_payload,
+            )
+            response = {
+                "deployment_id": command.deployment_id,
+                "dispatch_id": command.dispatch_id,
+                "state": "in_transit",
+                "required_grade": required_grade,
+                "deployed_units": decimal_text(allocated_total),
+                "expected_arrived_units": decimal_text(expected_delivery),
+                "expected_arrival": expected_arrival,
+                "selection": {
+                    "policy": "FEFO_NEAREST_EXPIRY",
+                    "considered_lots": len(lots),
+                    "compatible_lots": len(compatible),
+                    "rejected_lots": rejected,
+                },
+                "lots": lot_changes,
+            }
+            self.connection.execute(
+                "INSERT INTO traffic_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                "VALUES('deployment',?,?,?,?)",
+                (command.idempotency_key, request_digest, canonical_json(response), departed_at),
+            )
+            return response
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")

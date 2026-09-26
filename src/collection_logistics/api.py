@@ -76,7 +76,7 @@ class JsonApplication:
             if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "allocate":
                 return Response(200, self.service.allocate(actor, parts[1], payload["duty_date"]))
             if method == "POST" and path == "/deployments":
-                return Response(201, self.service.dispatch_deployment(actor, payload["deployment_id"], payload["dispatch_id"], payload["preservation_resource_lot_id"], int(payload["expected_revision"])))
+                return Response(201, self.service.dispatch_deployment(actor, payload))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
@@ -87,7 +87,10 @@ class JsonApplication:
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except CollectionDispatchError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error = {"code": exc.code, "message": str(exc)}
+            if getattr(exc, "details", None):
+                error["details"] = exc.details
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 

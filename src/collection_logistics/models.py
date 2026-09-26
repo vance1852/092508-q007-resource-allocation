@@ -16,6 +16,10 @@ IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
 RISK_INDEXES = {"HUMIDITY", "INJURY", "CONGESTION", "HAZMAT", "SECONDARY", "CUSTOM"}
 RESOURCE_KINDS = {"preservation-box", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team"}
 CENTER_KINDS = {"road-section", "receiving-vault", "herbarium-room", "storage", "patrol-station"}
+# 保藏等级：普通纸本周转箱可被低温防漏箱替代，反之不允许。数值越大防护能力越强。
+PRESERVATION_GRADES = {"STANDARD", "LOW_TEMP"}
+GRADE_ORDER = {"STANDARD": 1, "LOW_TEMP": 2}
+LOT_STATES = {"available", "quarantined", "depleted", "retired"}
 
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
@@ -168,6 +172,8 @@ class PreservationResourceLot:
     quantity_units: Decimal
     unit_cost_cny: Decimal
     received_at: str
+    expires_at: str | None
+    state: str
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "PreservationResourceLot":
@@ -176,14 +182,27 @@ class PreservationResourceLot:
             raise ValidationFailed("preservation_resource_kind 不是受支持的电源类型")
         received_at = required_text(raw.get("received_at"), "received_at", 40)
         try:
-            parse_utc(received_at, "received_at")
+            received_dt = parse_utc(received_at, "received_at")
         except ValueError as exc:
             raise ValidationFailed(str(exc)) from exc
+        grade = required_text(raw.get("grade"), "grade", 32).upper()
+        if grade not in PRESERVATION_GRADES:
+            raise ValidationFailed("grade 必须是 STANDARD（普通纸本周转箱）或 LOW_TEMP（低温防漏箱）")
+        expires_at_raw = raw.get("expires_at")
+        expires_at: str | None = None
+        if expires_at_raw is not None:
+            expires_at = date_text(expires_at_raw, "expires_at")
+            if date.fromisoformat(expires_at) < received_dt.date():
+                raise ValidationFailed("expires_at 不能早于 received_at 日期")
+        state = raw.get("state", "available")
+        state = required_text(state, "state", 16)
+        if state not in LOT_STATES:
+            raise ValidationFailed("state 必须是 available、quarantined、depleted 或 retired")
         return cls(
             preservation_resource_lot_id=identifier(raw.get("preservation_resource_lot_id"), "preservation_resource_lot_id"),
             center_id=identifier(raw.get("center_id"), "center_id"),
             preservation_resource_kind=preservation_resource_kind,
-            grade=required_text(raw.get("grade"), "grade", 32).upper(),
+            grade=grade,
             quantity_units=decimal_value(
                 raw.get("quantity_units"), "quantity_units", minimum=Decimal("0.001")
             ),
@@ -191,6 +210,8 @@ class PreservationResourceLot:
                 raw.get("unit_cost_cny"), "unit_cost_cny", minimum=Decimal("0")
             ),
             received_at=received_at,
+            expires_at=expires_at,
+            state=state,
         )
 
 
@@ -202,6 +223,7 @@ class DispatchRequest:
     duty_date: str
     requested_units: Decimal
     priority: int
+    required_grade: str
     idempotency_key: str
 
     @classmethod
@@ -209,6 +231,9 @@ class DispatchRequest:
         priority = raw.get("priority", 100)
         if isinstance(priority, bool) or not isinstance(priority, int) or not 1 <= priority <= 999:
             raise ValidationFailed("priority 必须是 1 到 999 的整数")
+        required_grade = required_text(raw.get("required_grade", "STANDARD"), "required_grade", 32).upper()
+        if required_grade not in PRESERVATION_GRADES:
+            raise ValidationFailed("required_grade 必须是 STANDARD（普通纸本周转箱）或 LOW_TEMP（低温防漏箱）")
         return cls(
             dispatch_id=identifier(raw.get("dispatch_id"), "dispatch_id"),
             corridor_id=identifier(raw.get("corridor_id"), "corridor_id"),
@@ -218,6 +243,27 @@ class DispatchRequest:
                 raw.get("requested_units"), "requested_units", minimum=Decimal("0.001")
             ),
             priority=priority,
+            required_grade=required_grade,
+            idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentCommand:
+    deployment_id: str
+    dispatch_id: str
+    expected_revision: int
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "DeploymentCommand":
+        revision = raw.get("expected_revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+            raise ValidationFailed("expected_revision 必须是正整数")
+        return cls(
+            deployment_id=identifier(raw.get("deployment_id"), "deployment_id"),
+            dispatch_id=identifier(raw.get("dispatch_id"), "dispatch_id"),
+            expected_revision=revision,
             idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
         )
 

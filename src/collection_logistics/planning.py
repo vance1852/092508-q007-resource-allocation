@@ -150,6 +150,31 @@ def delivered_after_loss(loaded: Decimal, delay_basis_points: int) -> Decimal:
     return quantize_volume(loaded * retained)
 
 
+def pick_lots_fefo(
+    required_units: Decimal,
+    candidates: Sequence[tuple[str, Decimal]],
+) -> tuple[list[tuple[str, Decimal]], Decimal]:
+    """按已排序（近效期优先 FEFO）的候选批次顺序扣减，返回(批次占用, 缺口)。
+
+    candidates 为 (批次号, 可用数量) 的有序序列；调用方负责所有兼容性过滤与排序。
+    """
+    if required_units < ZERO:
+        raise ValueError("需求数量不能为负数")
+    remaining = quantize_volume(required_units)
+    picks: list[tuple[str, Decimal]] = []
+    for lot_id, available_units in candidates:
+        if remaining <= ZERO:
+            break
+        available_units = quantize_volume(available_units)
+        if available_units <= ZERO:
+            continue
+        take = quantize_volume(min(remaining, available_units))
+        if take > ZERO:
+            picks.append((lot_id, take))
+            remaining = quantize_volume(remaining - take)
+    return picks, remaining
+
+
 def weighted_inventory_cost(lots: Iterable[Mapping[str, object]]) -> dict[str, str]:
     quantity = ZERO
     value = ZERO

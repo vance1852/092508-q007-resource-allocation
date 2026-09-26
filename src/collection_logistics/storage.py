@@ -79,18 +79,20 @@ CREATE TABLE IF NOT EXISTS preservation_resource_lots (
     preservation_resource_lot_id TEXT PRIMARY KEY,
     center_id TEXT NOT NULL REFERENCES response_centers(center_id),
     preservation_resource_kind TEXT NOT NULL,
-    grade TEXT NOT NULL,
+    grade TEXT NOT NULL CHECK(grade IN ('STANDARD','LOW_TEMP')),
     quantity_units TEXT NOT NULL,
     available_units TEXT NOT NULL,
     unit_cost_cny TEXT NOT NULL,
     received_at TEXT NOT NULL,
+    expires_at TEXT,
+    state TEXT NOT NULL DEFAULT 'available' CHECK(state IN ('available','quarantined','depleted','retired')),
     revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_inventory_available
-ON preservation_resource_lots(center_id, preservation_resource_kind, received_at);
+ON preservation_resource_lots(center_id, preservation_resource_kind, grade, received_at);
 
 CREATE TABLE IF NOT EXISTS preservation_resource_adjustments (
     adjustment_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +114,7 @@ CREATE TABLE IF NOT EXISTS dispatch_requests (
     allocated_units TEXT NOT NULL DEFAULT '0',
     arrived_units TEXT NOT NULL DEFAULT '0',
     priority INTEGER NOT NULL,
+    required_grade TEXT NOT NULL DEFAULT 'STANDARD' CHECK(required_grade IN ('STANDARD','LOW_TEMP')),
     state TEXT NOT NULL DEFAULT 'submitted'
         CHECK(state IN ('submitted','allocated','in_transit','delivered','cancelled')),
     revision INTEGER NOT NULL DEFAULT 1,
@@ -145,9 +148,31 @@ CREATE TABLE IF NOT EXISTS deployments (
     arrived_at TEXT,
     state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','delivered','disputed')),
     revision INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT,
+    request_sha256 TEXT,
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments_idempotency
+ON deployments(idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS deployment_lot_allocations (
+    allocation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    deployment_id TEXT NOT NULL REFERENCES deployments(deployment_id),
+    preservation_resource_lot_id TEXT NOT NULL REFERENCES preservation_resource_lots(preservation_resource_lot_id),
+    lot_grade TEXT NOT NULL,
+    lot_expires_at TEXT,
+    lot_revision_before INTEGER NOT NULL,
+    available_before_units TEXT NOT NULL,
+    allocated_units TEXT NOT NULL,
+    available_after_units TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(deployment_id, preservation_resource_lot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployment_lots_lot
+ON deployment_lot_allocations(preservation_resource_lot_id, allocation_id);
 
 CREATE TABLE IF NOT EXISTS response_scenarios (
     scenario_id TEXT PRIMARY KEY,
@@ -198,7 +223,7 @@ ON traffic_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -207,7 +232,39 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return connection
 
 
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """为早期数据库补齐批次状态、有效期和任务保藏等级需求列。"""
+    lot_columns = _column_names(connection, "preservation_resource_lots")
+    if lot_columns and "expires_at" not in lot_columns:
+        connection.execute("ALTER TABLE preservation_resource_lots ADD COLUMN expires_at TEXT")
+    if lot_columns and "state" not in lot_columns:
+        connection.execute(
+            "ALTER TABLE preservation_resource_lots ADD COLUMN state TEXT NOT NULL DEFAULT 'available'"
+        )
+    # 早期 grade 是自由文本（如风险指数名 HUMIDITY），统一映射到普通等级。
+    if lot_columns:
+        connection.execute(
+            "UPDATE preservation_resource_lots SET grade='STANDARD' WHERE grade IS NULL OR grade NOT IN ('STANDARD','LOW_TEMP')"
+        )
+    dispatch_columns = _column_names(connection, "dispatch_requests")
+    if dispatch_columns and "required_grade" not in dispatch_columns:
+        connection.execute(
+            "ALTER TABLE dispatch_requests ADD COLUMN required_grade TEXT NOT NULL DEFAULT 'STANDARD'"
+        )
+    deployment_columns = _column_names(connection, "deployments")
+    if deployment_columns and "idempotency_key" not in deployment_columns:
+        connection.execute("ALTER TABLE deployments ADD COLUMN idempotency_key TEXT")
+    if deployment_columns and "request_sha256" not in deployment_columns:
+        connection.execute("ALTER TABLE deployments ADD COLUMN request_sha256 TEXT")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
+    connection.executescript(SCHEMA)
+    _migrate(connection)
     connection.executescript(SCHEMA)
 
 
