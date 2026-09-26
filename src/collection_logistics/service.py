@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario, identifier
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -22,9 +23,11 @@ from .planning import (
     digest,
     effective_capacity,
     latest_streak,
+    lot_eligibility_violations,
     moving_average,
     quantize_volume,
     scenario_projection,
+    sequence_lot_deductions,
     weighted_inventory_cost,
 )
 from .storage import initialize, transaction
@@ -42,6 +45,7 @@ class CollectionLogisticsService:
     def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
+        self._deployment_lock = threading.RLock()
         initialize(connection)
 
     def _now(self) -> str:
@@ -265,7 +269,7 @@ class CollectionLogisticsService:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
                     "INSERT INTO preservation_resource_lots(preservation_resource_lot_id,center_id,preservation_resource_kind,grade,quantity_units,available_units,"
-                    "unit_cost_cny,received_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "unit_cost_cny,received_at,expires_at,state,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         lot.preservation_resource_lot_id,
                         lot.center_id,
@@ -275,6 +279,8 @@ class CollectionLogisticsService:
                         decimal_text(lot.quantity_units),
                         decimal_text(lot.unit_cost_cny),
                         lot.received_at,
+                        lot.expires_at,
+                        lot.state,
                         actor_id,
                         self._now(),
                     ),
@@ -321,14 +327,15 @@ class CollectionLogisticsService:
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
-                    "INSERT INTO dispatch_requests(dispatch_id,corridor_id,specimen_event_id,duty_date,requested_units,"
-                    "priority,idempotency_key,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO dispatch_requests(dispatch_id,corridor_id,specimen_event_id,duty_date,requested_units,required_grade,"
+                    "priority,idempotency_key,submitted_by,submitted_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (
                         dispatch_request.dispatch_id,
                         dispatch_request.corridor_id,
                         dispatch_request.specimen_event_id,
                         dispatch_request.duty_date,
                         decimal_text(dispatch_request.requested_units),
+                        dispatch_request.required_grade,
                         dispatch_request.priority,
                         dispatch_request.idempotency_key,
                         actor_id,
@@ -404,66 +411,202 @@ class CollectionLogisticsService:
             self._audit("route", corridor_id, "allocation.completed", actor_id, {"plan_id": plan_id})
         return {"plan_id": plan_id, **result}
 
+    @staticmethod
+    def _lot_ids(value: object) -> list[str]:
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ValidationFailed("preservation_resource_lot_id 必须是非空批次编号或编号列表")
+        lot_ids: list[str] = []
+        for item in value:
+            lot_id = identifier(item, "preservation_resource_lot_id")
+            if lot_id not in lot_ids:
+                lot_ids.append(lot_id)
+        return lot_ids
+
     def dispatch_deployment(
         self,
         actor_id: str,
         deployment_id: str,
         dispatch_id: str,
-        preservation_resource_lot_id: str,
+        preservation_resource_lot_id: str | Iterable[str],
         expected_revision: int,
     ) -> dict[str, Any]:
         self._require(actor_id, "deployment.write")
-        dispatch_request = self.connection.execute(
-            "SELECT n.*,r.delay_basis_points,r.response_minutes,r.origin_center_id FROM dispatch_requests n "
-            "JOIN road_corridors r ON r.corridor_id=n.corridor_id WHERE n.dispatch_id=?",
-            (dispatch_id,),
-        ).fetchone()
-        if dispatch_request is None:
-            raise NotFound("调度申请不存在")
-        if dispatch_request["state"] != "allocated" or dispatch_request["revision"] != expected_revision:
-            raise InvalidState("调度申请不是当前可资源到场版本")
-        lot = self.connection.execute("SELECT * FROM preservation_resource_lots WHERE preservation_resource_lot_id=?", (preservation_resource_lot_id,)).fetchone()
-        if lot is None:
-            raise NotFound("应急资源批次不存在")
-        allocated = Decimal(dispatch_request["allocated_units"])
-        available = Decimal(lot["available_units"])
-        if lot["center_id"] != dispatch_request["origin_center_id"] or lot["preservation_resource_kind"] != self.route(dispatch_request["corridor_id"])["preservation_resource_kind"]:
-            raise Conflict("应急资源批次与转运路线起点或电源类型不匹配")
-        if available < allocated:
-            raise Conflict("应急资源库存不足以完成分配")
-        expected_delivery = delivered_after_loss(allocated, int(dispatch_request["delay_basis_points"]))
-        departed_at = self._now()
-        with transaction(self.connection, immediate=True):
-            self.connection.execute(
-                "UPDATE preservation_resource_lots SET available_units=?,revision=revision+1 WHERE preservation_resource_lot_id=? AND revision=?",
-                (decimal_text(quantize_volume(available - allocated)), preservation_resource_lot_id, lot["revision"]),
-            )
-            self.connection.execute(
-                "UPDATE dispatch_requests SET state='in_transit',revision=revision+1 WHERE dispatch_id=? AND revision=?",
-                (dispatch_id, expected_revision),
-            )
-            self.connection.execute(
-                "INSERT INTO deployments(deployment_id,dispatch_id,inventory_preservation_resource_lot_id,deployed_units,"
-                "expected_arrived_units,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    deployment_id,
-                    dispatch_id,
-                    preservation_resource_lot_id,
-                    decimal_text(allocated),
-                    decimal_text(expected_delivery),
-                    departed_at,
-                    actor_id,
-                    departed_at,
-                ),
-            )
-            self._audit("deployment", deployment_id, "deployment.dispatched", actor_id, {"dispatch_id": dispatch_id})
-        return {
+        deployment_id = identifier(deployment_id, "deployment_id")
+        dispatch_id = identifier(dispatch_id, "dispatch_id")
+        lot_ids = self._lot_ids(preservation_resource_lot_id)
+        request_sha256 = digest({
             "deployment_id": deployment_id,
-            "state": "in_transit",
-            "deployed_units": decimal_text(allocated),
-            "expected_arrived_units": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(dispatch_request["response_minutes"]))),
-        }
+            "dispatch_id": dispatch_id,
+            "preservation_resource_lot_ids": lot_ids,
+            "expected_revision": expected_revision,
+        })
+        with self._deployment_lock:
+            with transaction(self.connection, immediate=True):
+                stored = self.connection.execute(
+                    "SELECT request_sha256,response_json FROM traffic_idempotency WHERE scope='deployment' AND idempotency_key=?",
+                    (deployment_id,),
+                ).fetchone()
+                if stored is not None:
+                    if stored["request_sha256"] != request_sha256:
+                        raise Conflict("调拨编号已对应不同的发料请求内容")
+                    return json.loads(stored["response_json"])
+                dispatch_request = self.connection.execute(
+                    "SELECT n.*,r.delay_basis_points,r.response_minutes,r.origin_center_id,"
+                    "r.preservation_resource_kind AS route_preservation_resource_kind "
+                    "FROM dispatch_requests n JOIN road_corridors r ON r.corridor_id=n.corridor_id WHERE n.dispatch_id=?",
+                    (dispatch_id,),
+                ).fetchone()
+                if dispatch_request is None:
+                    raise NotFound("调度申请不存在")
+                if dispatch_request["state"] != "allocated" or dispatch_request["revision"] != expected_revision:
+                    raise InvalidState("调度申请不是当前可资源到场版本")
+                required_grade = dispatch_request["required_grade"]
+                lots: dict[str, sqlite3.Row] = {}
+                for lot_id in lot_ids:
+                    lot = self.connection.execute(
+                        "SELECT * FROM preservation_resource_lots WHERE preservation_resource_lot_id=?",
+                        (lot_id,),
+                    ).fetchone()
+                    if lot is None:
+                        raise NotFound(f"应急资源批次 {lot_id} 不存在")
+                    lots[lot_id] = lot
+                violations: list[str] = []
+                for lot_id in lot_ids:
+                    lot = lots[lot_id]
+                    violations.extend(
+                        lot_eligibility_violations(
+                            lot_id=lot_id,
+                            kind=lot["preservation_resource_kind"],
+                            grade=lot["grade"],
+                            center_id=lot["center_id"],
+                            state=lot["state"],
+                            expires_at=lot["expires_at"],
+                            required_kind=dispatch_request["route_preservation_resource_kind"],
+                            required_grade=required_grade,
+                            origin_center_id=dispatch_request["origin_center_id"],
+                            duty_date=dispatch_request["duty_date"],
+                        )
+                    )
+                if violations:
+                    raise Conflict("；".join(violations), details={"violations": violations})
+                allocated = Decimal(dispatch_request["allocated_units"])
+                plan = sequence_lot_deductions(
+                    [(lot_id, Decimal(lots[lot_id]["available_units"])) for lot_id in lot_ids],
+                    allocated,
+                )
+                if plan is None:
+                    eligible_total = sum((Decimal(lots[lot_id]["available_units"]) for lot_id in lot_ids), Decimal("0"))
+                    raise Conflict(
+                        f"符合全部条件的批次合计可用 {decimal_text(quantize_volume(eligible_total))}，"
+                        f"低于任务需求 {decimal_text(allocated)}",
+                        details={
+                            "required_units": decimal_text(allocated),
+                            "eligible_available_units": decimal_text(quantize_volume(eligible_total)),
+                            "lots": [
+                                {
+                                    "preservation_resource_lot_id": lot_id,
+                                    "available_units": lots[lot_id]["available_units"],
+                                }
+                                for lot_id in lot_ids
+                            ],
+                        },
+                    )
+                expected_delivery = delivered_after_loss(allocated, int(dispatch_request["delay_basis_points"]))
+                departed_at = self._now()
+                lot_reports: list[dict[str, Any]] = []
+                for lot_id, take in plan:
+                    lot = lots[lot_id]
+                    before = Decimal(lot["available_units"])
+                    after = quantize_volume(before - take)
+                    cursor = self.connection.execute(
+                        "UPDATE preservation_resource_lots SET available_units=?,revision=revision+1 "
+                        "WHERE preservation_resource_lot_id=? AND revision=?",
+                        (decimal_text(after), lot_id, lot["revision"]),
+                    )
+                    if cursor.rowcount != 1:
+                        raise Conflict(f"批次 {lot_id} 库存在扣减期间被并发修改，请重试")
+                    lot_reports.append({
+                        "preservation_resource_lot_id": lot_id,
+                        "deducted_units": decimal_text(take),
+                        "previous_available_units": decimal_text(before),
+                        "remaining_available_units": decimal_text(after),
+                        "previous_revision": lot["revision"],
+                        "new_revision": lot["revision"] + 1,
+                    })
+                    self._audit("inventory_lot", lot_id, "inventory.allocated", actor_id, {
+                        "deployment_id": deployment_id,
+                        "dispatch_id": dispatch_id,
+                        "deducted_units": decimal_text(take),
+                        "previous_available_units": decimal_text(before),
+                        "remaining_available_units": decimal_text(after),
+                    })
+                self.connection.execute(
+                    "UPDATE dispatch_requests SET state='in_transit',revision=revision+1 WHERE dispatch_id=? AND revision=?",
+                    (dispatch_id, expected_revision),
+                )
+                self.connection.execute(
+                    "INSERT INTO deployments(deployment_id,dispatch_id,inventory_preservation_resource_lot_id,deployed_units,"
+                    "expected_arrived_units,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        deployment_id,
+                        dispatch_id,
+                        plan[0][0],
+                        decimal_text(allocated),
+                        decimal_text(expected_delivery),
+                        departed_at,
+                        actor_id,
+                        departed_at,
+                    ),
+                )
+                for lot_id, take in plan:
+                    self.connection.execute(
+                        "INSERT INTO deployment_lots(deployment_id,preservation_resource_lot_id,units) VALUES(?,?,?)",
+                        (deployment_id, lot_id, decimal_text(take)),
+                    )
+                response = {
+                    "deployment_id": deployment_id,
+                    "state": "in_transit",
+                    "deployed_units": decimal_text(allocated),
+                    "expected_arrived_units": decimal_text(expected_delivery),
+                    "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(dispatch_request["response_minutes"]))),
+                    "lots": [
+                        {
+                            "preservation_resource_lot_id": report["preservation_resource_lot_id"],
+                            "deducted_units": report["deducted_units"],
+                            "remaining_available_units": report["remaining_available_units"],
+                        }
+                        for report in lot_reports
+                    ],
+                }
+                self.connection.execute(
+                    "INSERT INTO traffic_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                    "VALUES('deployment',?,?,?,?)",
+                    (deployment_id, request_sha256, canonical_json(response), departed_at),
+                )
+                self._audit("deployment", deployment_id, "deployment.dispatched", actor_id, {
+                    "dispatch_id": dispatch_id,
+                    "corridor_id": dispatch_request["corridor_id"],
+                    "duty_date": dispatch_request["duty_date"],
+                    "requirements": {
+                        "preservation_resource_kind": dispatch_request["route_preservation_resource_kind"],
+                        "required_grade": required_grade,
+                        "origin_center_id": dispatch_request["origin_center_id"],
+                        "usable_state": "usable",
+                        "not_expired_before": dispatch_request["duty_date"],
+                    },
+                    "lots": [
+                        {
+                            **report,
+                            "selection_basis": f"指定批次[{index}]：材料类别、保藏等级、起运库房、有效期与可用状态全部满足任务需求",
+                        }
+                        for index, report in enumerate(lot_reports)
+                    ],
+                    "deployed_units": decimal_text(allocated),
+                    "expected_arrived_units": decimal_text(expected_delivery),
+                })
+                return response
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")

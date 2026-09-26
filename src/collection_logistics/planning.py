@@ -150,6 +150,56 @@ def delivered_after_loss(loaded: Decimal, delay_basis_points: int) -> Decimal:
     return quantize_volume(loaded * retained)
 
 
+def lot_eligibility_violations(
+    *,
+    lot_id: str,
+    kind: str,
+    grade: str,
+    center_id: str,
+    state: str,
+    expires_at: str | None,
+    required_kind: str,
+    required_grade: str | None,
+    origin_center_id: str,
+    duty_date: str,
+) -> list[str]:
+    """逐项核对批次与任务需求，返回所有不满足的约束说明（空列表表示全部满足）。"""
+    violations: list[str] = []
+    if kind != required_kind:
+        violations.append(f"批次 {lot_id} 材料类别为 {kind}，任务要求 {required_kind}")
+    if required_grade is not None and grade != required_grade:
+        violations.append(f"批次 {lot_id} 保藏等级为 {grade}，任务要求 {required_grade}")
+    if center_id != origin_center_id:
+        violations.append(f"批次 {lot_id} 位于库房 {center_id}，不在起运库房 {origin_center_id}")
+    if state != "usable":
+        violations.append(f"批次 {lot_id} 状态为 {state}，不是可用状态")
+    if expires_at is not None and expires_at < duty_date + "T00:00:00Z":
+        violations.append(f"批次 {lot_id} 有效期至 {expires_at}，早于任务日期 {duty_date}")
+    return violations
+
+
+def sequence_lot_deductions(
+    ordered_available: Sequence[tuple[str, Decimal]],
+    required: Decimal,
+) -> list[tuple[str, Decimal]] | None:
+    """按给定顺序在多批次间分摊扣减，返回 [(批次, 扣减量)]；合计不足时返回 None。"""
+    if required <= ZERO:
+        raise ValueError("扣减数量必须为正数")
+    total = sum((available for _, available in ordered_available), ZERO)
+    if total < required:
+        return None
+    remaining = quantize_volume(required)
+    plan: list[tuple[str, Decimal]] = []
+    for lot_id, available in ordered_available:
+        if remaining <= ZERO:
+            break
+        take = quantize_volume(min(available, remaining))
+        if take > ZERO:
+            plan.append((lot_id, take))
+            remaining = quantize_volume(remaining - take)
+    return plan
+
+
 def weighted_inventory_cost(lots: Iterable[Mapping[str, object]]) -> dict[str, str]:
     quantity = ZERO
     value = ZERO

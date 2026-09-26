@@ -8,7 +8,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
-from .clock import parse_utc
+from .clock import parse_utc, utc_text
 from .errors import ValidationFailed
 
 
@@ -16,6 +16,8 @@ IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
 RISK_INDEXES = {"HUMIDITY", "INJURY", "CONGESTION", "HAZMAT", "SECONDARY", "CUSTOM"}
 RESOURCE_KINDS = {"preservation-box", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team"}
 CENTER_KINDS = {"road-section", "receiving-vault", "herbarium-room", "storage", "patrol-station"}
+LOT_STATES = {"usable", "quarantined", "retired"}
+USABLE_LOT_STATE = "usable"
 
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
@@ -168,6 +170,8 @@ class PreservationResourceLot:
     quantity_units: Decimal
     unit_cost_cny: Decimal
     received_at: str
+    expires_at: str | None = None
+    state: str = USABLE_LOT_STATE
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "PreservationResourceLot":
@@ -179,6 +183,16 @@ class PreservationResourceLot:
             parse_utc(received_at, "received_at")
         except ValueError as exc:
             raise ValidationFailed(str(exc)) from exc
+        expires_raw = raw.get("expires_at")
+        expires_at: str | None = None
+        if expires_raw is not None:
+            try:
+                expires_at = utc_text(parse_utc(required_text(expires_raw, "expires_at", 40), "expires_at"))
+            except ValueError as exc:
+                raise ValidationFailed(str(exc)) from exc
+        state = required_text(raw.get("state", USABLE_LOT_STATE), "state", 16).lower()
+        if state not in LOT_STATES:
+            raise ValidationFailed("state 不是受支持的批次状态")
         return cls(
             preservation_resource_lot_id=identifier(raw.get("preservation_resource_lot_id"), "preservation_resource_lot_id"),
             center_id=identifier(raw.get("center_id"), "center_id"),
@@ -191,6 +205,8 @@ class PreservationResourceLot:
                 raw.get("unit_cost_cny"), "unit_cost_cny", minimum=Decimal("0")
             ),
             received_at=received_at,
+            expires_at=expires_at,
+            state=state,
         )
 
 
@@ -203,12 +219,19 @@ class DispatchRequest:
     requested_units: Decimal
     priority: int
     idempotency_key: str
+    required_grade: str | None = None
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "DispatchRequest":
         priority = raw.get("priority", 100)
         if isinstance(priority, bool) or not isinstance(priority, int) or not 1 <= priority <= 999:
             raise ValidationFailed("priority 必须是 1 到 999 的整数")
+        required_grade_raw = raw.get("required_grade")
+        required_grade = (
+            None
+            if required_grade_raw is None
+            else required_text(required_grade_raw, "required_grade", 32).upper()
+        )
         return cls(
             dispatch_id=identifier(raw.get("dispatch_id"), "dispatch_id"),
             corridor_id=identifier(raw.get("corridor_id"), "corridor_id"),
@@ -219,6 +242,7 @@ class DispatchRequest:
             ),
             priority=priority,
             idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+            required_grade=required_grade,
         )
 
 

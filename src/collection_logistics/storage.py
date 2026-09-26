@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS preservation_resource_lots (
     available_units TEXT NOT NULL,
     unit_cost_cny TEXT NOT NULL,
     received_at TEXT NOT NULL,
+    expires_at TEXT,
+    state TEXT NOT NULL DEFAULT 'usable' CHECK(state IN ('usable','quarantined','retired')),
     revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL
@@ -109,6 +111,7 @@ CREATE TABLE IF NOT EXISTS dispatch_requests (
     specimen_event_id TEXT NOT NULL,
     duty_date TEXT NOT NULL,
     requested_units TEXT NOT NULL,
+    required_grade TEXT,
     allocated_units TEXT NOT NULL DEFAULT '0',
     arrived_units TEXT NOT NULL DEFAULT '0',
     priority INTEGER NOT NULL,
@@ -147,6 +150,13 @@ CREATE TABLE IF NOT EXISTS deployments (
     revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deployment_lots (
+    deployment_id TEXT NOT NULL REFERENCES deployments(deployment_id),
+    preservation_resource_lot_id TEXT NOT NULL REFERENCES preservation_resource_lots(preservation_resource_lot_id),
+    units TEXT NOT NULL,
+    PRIMARY KEY (deployment_id, preservation_resource_lot_id)
 );
 
 CREATE TABLE IF NOT EXISTS response_scenarios (
@@ -198,7 +208,7 @@ ON traffic_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -209,6 +219,22 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate(connection)
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """为已存在的 SQLite 数据库补齐新增列（新库由 SCHEMA 直接建全）。"""
+    lot_columns = {row[1] for row in connection.execute("PRAGMA table_info(preservation_resource_lots)")}
+    if "expires_at" not in lot_columns:
+        connection.execute("ALTER TABLE preservation_resource_lots ADD COLUMN expires_at TEXT")
+    if "state" not in lot_columns:
+        connection.execute(
+            "ALTER TABLE preservation_resource_lots ADD COLUMN state TEXT NOT NULL DEFAULT 'usable' "
+            "CHECK(state IN ('usable','quarantined','retired'))"
+        )
+    dispatch_columns = {row[1] for row in connection.execute("PRAGMA table_info(dispatch_requests)")}
+    if "required_grade" not in dispatch_columns:
+        connection.execute("ALTER TABLE dispatch_requests ADD COLUMN required_grade TEXT")
 
 
 @contextmanager
